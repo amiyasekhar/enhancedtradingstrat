@@ -1,0 +1,22 @@
+# Ignore everything by default
+*
+
+# Keep Python source files
+!*.py
+
+# Keep this file
+!.gitignore
+
+# Allow directory traversal so nested *.py are included
+!*/
+
+.env
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+

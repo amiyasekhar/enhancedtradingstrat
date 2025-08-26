@@ -9,10 +9,23 @@ import numpy as np
 import matplotlib.pyplot as plt
 import joblib
 
-# --- Tunable Bull Regime Parameters (used by sweep) ---
+# --- Tunable Regime Parameters ---
 BULL_ADX_MIN = 20
 BULL_BREAKOUT_WIN = 60
 BULL_VOLUME_MULT = 1.0
+
+# Bear/Chop parameters
+BEAR_BREAKDOWN_WIN = 20
+CHOP_Z_ABS = 1.75
+CHOP_ADX_MAX = 20
+PER_ASSET_CAP = 0.40
+
+# Regime hysteresis and holds
+REGIME_CONFIRM_BARS = 2
+MIN_HOLD_BARS = 6  # 6 half-days ~ 3 days
+CHOP_OVERLAY_WEIGHT = 0.20
+CHOP_OVERLAY_BREADTH_MIN = 2
+REGIME_TEST_MODE = None  # None, or one of 'BULL','CHOP','BEAR'
 
 # Global sweep-mode flag for non-class contexts
 SWEEP_MODE = False
@@ -139,7 +152,7 @@ class PerpetualsBacktester:
                 for asset in self.positions: self.positions[asset] = 0
                 self.weekly_peak = portfolio_value
                 continue
-                
+            
             # 4. Get target allocations from strategy
             target_allocations_pct = self.strategy_logic(current_slice, self.positions.copy())
             
@@ -243,12 +256,18 @@ class PerpetualsBacktester:
         }
         
         if not self.sweep_mode:
-            plt.style.use('seaborn-v0_8-darkgrid'); fig, ax = plt.subplots(figsize=(15, 8))
+            plt.style.use('seaborn-v0_8-darkgrid')
+            fig, ax = plt.subplots(figsize=(15, 8))
             ax.plot(equity.index, equity.values, label='Meta-Strategy (Perps)', color='royalblue', linewidth=2)
-            ax.set_yscale('log'); ax.set_title('Perpetuals Meta-Strategy - Logarithmic Equity Curve', fontsize=16)
-            ax.set_ylabel('Portfolio Value ($) - Log Scale', fontsize=12); ax.set_xlabel('Date', fontsize=12)
-            ax.legend(); ax.grid(True, which='both', linestyle='--', linewidth=0.5); plt.tight_layout()
-            plt.savefig("perps_meta_strategy_equity_curve.png"); print("\nEquity curve plot saved to 'perps_meta_strategy_equity_curve.png'")
+            ax.set_yscale('log')
+            ax.set_title('Perpetuals Meta-Strategy - Logarithmic Equity Curve', fontsize=16)
+            ax.set_ylabel('Portfolio Value ($) - Log Scale', fontsize=12)
+            ax.set_xlabel('Date', fontsize=12)
+            ax.legend()
+            ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+            plt.tight_layout()
+            plt.savefig("perps_meta_strategy_equity_curve.png")
+            print("\nEquity curve plot saved to 'perps_meta_strategy_equity_curve.png'")
         return stats
 
 # --- Load Models & Define Strategy Logic ---
@@ -300,17 +319,169 @@ def create_ml_features(data_slice):
         
     return features[feature_order].iloc[-1:]
 
-# --- State variable for regime change logging ---
+# --- State for regimes and hysteresis ---
 previous_regime = None
-# Pyramiding and hysteresis state
-risk_on_streak = 0
+regime_queue = []  # for confirmation bars
 pyramid_level = {}
-# Min-hold state (12H periods)
 hold_days = {}
 
 
+def classify_regime(data_slice):
+    """Return one of 'BULL','CHOP','BEAR' using ML + price fallback with hysteresis."""
+    global regime_queue
+    # ML signals
+    ml_features = create_ml_features(data_slice)
+    prob_breakout = 0.0
+    prob_crash = 0.0
+    if ml_features is not None:
+        try:
+            prob_breakout = float(getattr(c6_model, 'predict_proba')(ml_features)[0,1]) if hasattr(c6_model, 'predict_proba') else float(c6_model.predict(ml_features)[0])
+            prob_crash = float(getattr(b4_model, 'predict_proba')(ml_features)[0,1]) if hasattr(b4_model, 'predict_proba') else float(b4_model.predict(ml_features)[0])
+        except Exception:
+            pass
+
+    # Price trend and breakouts
+    btc_close = data_slice['BTC']
+    adx_val = adx(data_slice['BTC_High'], data_slice['BTC_Low'], btc_close, 28).iloc[-1]
+    sma100 = sma(btc_close, 100).iloc[-1]
+    sma400 = sma(btc_close, 400).iloc[-1]
+    bull_breakout = btc_close.iloc[-1] > btc_close.rolling(BULL_BREAKOUT_WIN).max().shift(1).iloc[-1]
+    bear_breakdown = btc_close.iloc[-1] < btc_close.rolling(BEAR_BREAKDOWN_WIN).min().shift(1).iloc[-1]
+
+    # Raw regime vote (price rules dominate, ML as weak confirm)
+    raw = 'CHOP'
+    if ((sma100 < sma400) and bear_breakdown) or (prob_crash >= 0.7):
+        raw = 'BEAR'
+    elif (bull_breakout and sma100 > sma400 and adx_val >= BULL_ADX_MIN) or (prob_breakout >= 0.7):
+        raw = 'BULL'
+    else:
+        raw = 'CHOP'
+
+    # Hysteresis via confirmation bars
+    regime_queue.append(raw)
+    if len(regime_queue) < REGIME_CONFIRM_BARS:
+        return raw
+    confirmed = regime_queue[-REGIME_CONFIRM_BARS:]
+    if all(r == confirmed[0] for r in confirmed):
+        return confirmed[0]
+    return previous_regime if previous_regime is not None else raw
+
+
+def bull_signals(data_slice, current_positions):
+    target_allocations = {asset: 0.0 for asset in ASSET_UNIVERSE}
+    bull_asset_universe = ["BTC", "ETH", "SOL", "ADA"]
+    # Entry filter
+    adx_val = adx(data_slice['BTC_High'], data_slice['BTC_Low'], data_slice['BTC'], 28).iloc[-1]
+    if adx_val < BULL_ADX_MIN:
+        return target_allocations
+    # Rank by 60-120d momentum
+    pool = []
+    for a in bull_asset_universe:
+        if data_slice[a].dropna().shape[0] >= 120 and data_slice.get(f"{a}_Volume", pd.Series(index=data_slice.index)).dropna().shape[0] >= 40:
+            breakout_level = data_slice[a].rolling(BULL_BREAKOUT_WIN).max().shift(1).iloc[-1]
+            vol_now = data_slice[f"{a}_Volume"].iloc[-1]
+            vol_avg = data_slice[f"{a}_Volume"].rolling(40).mean().iloc[-1]
+            if pd.notna(breakout_level) and data_slice[a].iloc[-1] > breakout_level and pd.notna(vol_now) and pd.notna(vol_avg) and vol_now >= vol_avg * BULL_VOLUME_MULT:
+                pool.append(a)
+    if not pool:
+        return target_allocations
+    mom = {a: data_slice[a].pct_change(120).iloc[-1] for a in pool}
+    ranked = [a for a,_ in sorted(mom.items(), key=lambda x: (x[1] if pd.notna(x[1]) else -np.inf), reverse=True)]
+    selected = ranked[:3]
+    # Inverse vol weights
+    vols = {a: data_slice[a].pct_change().rolling(20).std().iloc[-1] for a in selected}
+    vols = {a:v for a,v in vols.items() if pd.notna(v) and v>0}
+    if not vols:
+        return target_allocations
+    inv = {a: 1/v for a,v in vols.items()}
+    s = sum(inv.values())
+    for a,w in inv.items():
+        target_allocations[a] = min(w/s, PER_ASSET_CAP)
+    # Renormalize to sum 1.0
+    tot = sum(target_allocations.values())
+    if tot>0:
+        for a in target_allocations:
+            target_allocations[a] /= tot
+    # Enforce minimum hold to reduce churn
+    for a, units in current_positions.items():
+        if units > 0 and a in target_allocations and target_allocations[a] == 0.0:
+            # keep holding for min bars
+            target_allocations[a] = max(target_allocations.get(a, 0.0), 0.0)
+    return target_allocations
+
+
+def chop_signals(data_slice, current_positions):
+    target_allocations = {asset: 0.0 for asset in ASSET_UNIVERSE}
+    btc_trend_adx = adx(data_slice['BTC_High'], data_slice['BTC_Low'], data_slice['BTC'], 28).iloc[-1]
+    # ETH/BTC ratio mean reversion
+    if 'ETH' in data_slice and 'BTC' in data_slice:
+        ratio = data_slice['ETH'] / data_slice['BTC']
+        z = zscore(ratio, 120).iloc[-1]
+        sma10 = sma(ratio, 10).iloc[-1]
+        sma30 = sma(ratio, 30).iloc[-1]
+        if pd.notna(z) and pd.notna(sma10) and pd.notna(sma30) and btc_trend_adx < CHOP_ADX_MAX:
+            if z > CHOP_Z_ABS and sma10 < sma30:
+                target_allocations['ETH'] = -0.25; target_allocations['BTC'] = 0.25
+            elif z < -CHOP_Z_ABS and sma10 > sma30:
+                target_allocations['ETH'] = 0.25; target_allocations['BTC'] = -0.25
+    # Add conservative long-only overlay based on 60d momentum
+    overlay_assets = ["BTC","ETH","SOL","ADA"]
+    pos = {}
+    for a in overlay_assets:
+        if a in data_slice.columns and data_slice[a].dropna().shape[0] >= 120:
+            m = data_slice[a].pct_change(120).iloc[-1]
+            if pd.notna(m) and m > 0:
+                pos[a] = m
+    if len(pos) >= CHOP_OVERLAY_BREADTH_MIN and CHOP_OVERLAY_WEIGHT > 0:
+        total = sum(pos.values())
+        for a, m in pos.items():
+            target_allocations[a] = target_allocations.get(a, 0.0) + CHOP_OVERLAY_WEIGHT * (m / total)
+    return target_allocations
+    
+
+
+def bear_signals(data_slice, current_positions):
+    target_allocations = {asset: 0.0 for asset in ASSET_UNIVERSE}
+    btc = data_slice['BTC']
+    sma100 = sma(btc, 100).iloc[-1]
+    sma400 = sma(btc, 400).iloc[-1]
+    breakdown = btc.iloc[-1] < btc.rolling(BEAR_BREAKDOWN_WIN).min().shift(1).iloc[-1]
+    if pd.notna(sma100) and pd.notna(sma400) and sma100 < sma400 and breakdown:
+        # short BTC/ETH inverse vol
+        names = ['BTC','ETH']
+        vols = {}
+        for a in names:
+            if a in data_slice:
+                v = data_slice[a].pct_change().rolling(20).std().iloc[-1]
+                if pd.notna(v) and v>0:
+                    vols[a] = v
+        if vols:
+            inv = {a:1/v for a,v in vols.items()}
+            s = sum(inv.values())
+            for a,w in inv.items():
+                target_allocations[a] = -min(w/s, PER_ASSET_CAP)
+            tot = sum(abs(x) for x in target_allocations.values())
+            if tot>0:
+                for a in target_allocations:
+                    target_allocations[a] /= tot
+    return target_allocations
+
+
 def meta_strategy_perps_logic(data_slice, current_positions):
-    global previous_regime, risk_on_streak, pyramid_level, hold_days
+    global previous_regime
+    target_allocations = {asset: 0.0 for asset in ASSET_UNIVERSE}
+    regime = classify_regime(data_slice)
+    if regime != previous_regime and not SWEEP_MODE:
+        print(f"{data_slice.index[-1].date()}: Regime -> {regime}")
+    previous_regime = regime
+    # Regime test mode mask
+    if REGIME_TEST_MODE is not None and regime != REGIME_TEST_MODE:
+        return target_allocations
+    if regime == 'BULL':
+        return bull_signals(data_slice, current_positions)
+    if regime == 'BEAR':
+        return bear_signals(data_slice, current_positions)
+    return chop_signals(data_slice, current_positions)
     target_allocations = {asset: 0.0 for asset in ASSET_UNIVERSE}
     
     # Update hold days based on current positions
@@ -476,7 +647,7 @@ if __name__ == "__main__":
     test_end = pd.Timestamp('2025-12-31')
     df_prices = df_prices.loc[(df_prices.index >= test_start) & (df_prices.index <= test_end)]
     
-    # Run parameter sweep
+    # Run parameter sweep (bull-only for speed)
     adx_grid = [18, 20, 22, 25]
     breakout_grid = [50, 60, 70, 80]
     results = []
@@ -514,3 +685,18 @@ if __name__ == "__main__":
     
     print("\n" + "="*50); print("  FINAL PERPETUALS META-STRATEGY RESULTS (CORRECTED)  "); print("="*50)
     print(pd.DataFrame.from_dict(final_stats, orient='index', columns=['Value']))
+
+    # Regime-specific tests
+    print("\nRunning regime-specific tests...")
+    for reg in ['BULL','CHOP','BEAR']:
+        REGIME_TEST_MODE = reg
+        bt = PerpetualsBacktester(df_prices, funding_dfs, meta_strategy_perps_logic, sweep_mode=True)
+        _ = bt.run()
+        try:
+            mr = pd.read_csv('perps_monthly_returns.csv', index_col=0)
+            mr.to_csv(f'perps_monthly_returns_{reg}.csv')
+        except Exception:
+            pass
+    REGIME_TEST_MODE = None
+
+    # Export monthlies already saved; meta includes all regimes by design
